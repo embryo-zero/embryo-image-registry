@@ -1,0 +1,341 @@
+// Copyright Project Harbor Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/gocraft/work"
+	"github.com/gomodule/redigo/redis"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	common_dao "github.com/goharbor/harbor/src/common/dao"
+	"github.com/goharbor/harbor/src/jobservice/config"
+	"github.com/goharbor/harbor/src/jobservice/env"
+	"github.com/goharbor/harbor/src/jobservice/job"
+	"github.com/goharbor/harbor/src/jobservice/job/impl"
+	"github.com/goharbor/harbor/src/jobservice/lcm"
+	"github.com/goharbor/harbor/src/jobservice/logger"
+	"github.com/goharbor/harbor/src/jobservice/logger/backend"
+	"github.com/goharbor/harbor/src/jobservice/tests"
+)
+
+// RedisRunnerTestSuite tests functions of redis runner
+type RedisRunnerTestSuite struct {
+	suite.Suite
+
+	lcmCtl lcm.Controller
+
+	envContext *env.Context
+
+	cancel    context.CancelFunc
+	namespace string
+	pool      *redis.Pool
+}
+
+// TestRedisRunnerTestSuite is entry of go test
+func TestRedisRunnerTestSuite(t *testing.T) {
+	common_dao.PrepareTestForPostgresSQL()
+	suite.Run(t, new(RedisRunnerTestSuite))
+}
+
+// SetupSuite prepares test suite
+func (suite *RedisRunnerTestSuite) SetupSuite() {
+	ctx, cancel := context.WithCancel(context.Background())
+	suite.cancel = cancel
+
+	suite.envContext = &env.Context{
+		SystemContext: ctx,
+		WG:            new(sync.WaitGroup),
+		ErrorChan:     make(chan error, 1),
+		JobContext:    impl.NewDefaultContext(ctx),
+	}
+
+	suite.namespace = tests.GiveMeTestNamespace()
+	suite.pool = tests.GiveMeRedisPool()
+
+	suite.lcmCtl = lcm.NewController(
+		suite.envContext,
+		suite.namespace,
+		suite.pool,
+		func(hookURL string, change *job.StatusChange) error { return nil },
+	)
+
+	fakeStats := &job.Stats{
+		Info: &job.StatsInfo{
+			JobID:    "FAKE-j",
+			JobName:  "fakeParentJob",
+			JobKind:  job.KindGeneric,
+			Status:   job.PendingStatus.String(),
+			IsUnique: false,
+		},
+	}
+	_, err := suite.lcmCtl.New(fakeStats)
+	require.NoError(suite.T(), err, "lcm new: nil error expected but got %s", err)
+}
+
+// SetupTest prepares test cases
+func (suite *RedisRunnerTestSuite) SetupTest() {
+	t, err := suite.lcmCtl.Track("FAKE-j")
+	require.NoError(suite.T(), err)
+	err = t.Update("status", job.PendingStatus.String()) // reset
+	assert.NoError(suite.T(), err)
+}
+
+// TearDownSuite clears the test suite
+func (suite *RedisRunnerTestSuite) TearDownSuite() {
+	suite.cancel()
+}
+
+// TestJobWrapper tests the redis job wrapper
+func (suite *RedisRunnerTestSuite) TestJobWrapper() {
+	j := &work.Job{
+		ID:         "FAKE-j",
+		Name:       "fakeParentJob",
+		EnqueuedAt: time.Now().Add(5 * time.Minute).Unix(),
+	}
+
+	oldJobLoggerCfg := config.DefaultConfig.JobLoggerConfigs
+	defer func() {
+		config.DefaultConfig.JobLoggerConfigs = oldJobLoggerCfg
+	}()
+
+	config.DefaultConfig.JobLoggerConfigs = []*config.LoggerConfig{
+		{
+			Name:  "STD_OUTPUT",
+			Level: "DEBUG",
+			Settings: map[string]any{
+				"output": backend.StdErr,
+			},
+		},
+		{
+			Name:  "FILE",
+			Level: "ERROR",
+			Settings: map[string]any{
+				"base_dir": os.TempDir(),
+			},
+			Sweeper: &config.LogSweeperConfig{
+				Duration: 5,
+				Settings: map[string]any{
+					"work_dir": os.TempDir(),
+				},
+			},
+		},
+	}
+
+	redisJob := NewRedisJob((*fakeParentJob)(nil), suite.envContext, suite.lcmCtl)
+	err := redisJob.Run(j)
+	require.NoError(suite.T(), err, "redis job: nil error expected but got %s", err)
+}
+
+// TestJobWrapperInvalidTracker tests job runner with invalid job ID
+func (suite *RedisRunnerTestSuite) TestJobWrapperInvalidTracker() {
+	j := &work.Job{
+		ID:         "FAKE-j2",
+		Name:       "fakeParentJob",
+		EnqueuedAt: time.Now().Add(5 * time.Minute).Unix(),
+		Fails:      3,
+	}
+
+	redisJob := NewRedisJob((*fakeParentJob)(nil), suite.envContext, suite.lcmCtl)
+	err := redisJob.Run(j)
+	require.Error(suite.T(), err, "redis job: non nil error expected but got nil")
+	assert.Equal(suite.T(), int64(10000000000), j.Fails)
+}
+
+// TestJobWrapperPanic tests job runner panic
+func (suite *RedisRunnerTestSuite) TestJobWrapperPanic() {
+	j := &work.Job{
+		ID:         "FAKE-j",
+		Name:       "fakePanicJob",
+		EnqueuedAt: time.Now().Add(5 * time.Minute).Unix(),
+	}
+
+	redisJob := NewRedisJob((*fakePanicJob)(nil), suite.envContext, suite.lcmCtl)
+	err := redisJob.Run(j)
+	assert.Error(suite.T(), err)
+}
+
+// TestJobWrapperStopped tests job runner stopped
+func (suite *RedisRunnerTestSuite) TestJobWrapperStopped() {
+	j := &work.Job{
+		ID:         "FAKE-j",
+		Name:       "fakePanicJob",
+		EnqueuedAt: time.Now().Add(5 * time.Minute).Unix(),
+	}
+
+	t, err := suite.lcmCtl.Track("FAKE-j")
+	require.NoError(suite.T(), err)
+	err = t.Stop()
+	require.NoError(suite.T(), err)
+
+	redisJob := NewRedisJob((*fakeParentJob)(nil), suite.envContext, suite.lcmCtl)
+	err = redisJob.Run(j)
+	require.NoError(suite.T(), err)
+}
+
+type fakeParentJob struct {
+}
+
+func (j *fakeParentJob) MaxFails() uint {
+	return 1
+}
+
+func (j *fakeParentJob) MaxCurrency() uint {
+	return 0
+}
+
+func (j *fakeParentJob) ShouldRetry() bool {
+	return false
+}
+
+func (j *fakeParentJob) Validate(params job.Parameters) error {
+	return nil
+}
+
+func (j *fakeParentJob) Run(ctx job.Context, params job.Parameters) error {
+	_ = ctx.Checkin("start")
+	ctx.OPCommand()
+	return nil
+}
+
+type fakePanicJob struct {
+}
+
+func (j *fakePanicJob) MaxFails() uint {
+	return 1
+}
+
+func (j *fakePanicJob) MaxCurrency() uint {
+	return 0
+}
+
+func (j *fakePanicJob) ShouldRetry() bool {
+	return false
+}
+
+func (j *fakePanicJob) Validate(params job.Parameters) error {
+	return nil
+}
+
+func (j *fakePanicJob) Run(ctx job.Context, params job.Parameters) error {
+	panic("for testing")
+}
+
+func TestCleanErrorMessage(t *testing.T) {
+	assert.Equal(t, "", cleanErrorMessage(""))
+	assert.Equal(t, "failed with error", cleanErrorMessage("  failed \n with \t error \n "))
+
+	longMsg := strings.Repeat("a", 600)
+	cleaned := cleanErrorMessage(longMsg)
+	assert.Equal(t, 512, len(cleaned))
+	assert.True(t, strings.HasSuffix(cleaned, "..."))
+
+	// UTF-8 multibyte characters truncation
+	longUTF8 := strings.Repeat("错误", 200) // 1200 bytes
+	cleanedUTF8 := cleanErrorMessage(longUTF8)
+	assert.True(t, len(cleanedUTF8) <= 512)
+	assert.True(t, utf8.ValidString(cleanedUTF8))
+	assert.True(t, strings.HasSuffix(cleanedUTF8, "..."))
+}
+
+func TestExtractLastLogLines(t *testing.T) {
+	assert.Equal(t, "", extractLastLogLines(nil, 3))
+	assert.Equal(t, "", extractLastLogLines([]byte(""), 3))
+	assert.Equal(t, "", extractLastLogLines([]byte("   \n\n  "), 3))
+
+	// fewer than 3 lines
+	log2 := []byte("line 1\nline 2\n")
+	assert.Equal(t, "line 1\nline 2", extractLastLogLines(log2, 3))
+
+	// more than 3 lines (5 lines)
+	var allLines []string
+	for i := 1; i <= 5; i++ {
+		allLines = append(allLines, fmt.Sprintf("log line %d", i))
+	}
+	log5 := []byte(strings.Join(allLines, "\r\n") + "\n\n")
+	expected := strings.Join(allLines[2:], "\n")
+	assert.Equal(t, expected, extractLastLogLines(log5, 3))
+
+	// UTF-8 log lines truncation exceeding 4096 bytes (last 3 lines exceed 4096 bytes)
+	// ~3000 bytes per line
+	longLine := strings.Repeat("这是一段包含中文字符的日志内容。", 50) + "\n"
+	longLogUTF8 := []byte(strings.Repeat(longLine, 3))
+	resUTF8 := extractLastLogLines(longLogUTF8, 3)
+	assert.True(t, len(resUTF8) <= 4096)
+	assert.True(t, utf8.ValidString(resUTF8))
+	assert.True(t, strings.HasPrefix(resUTF8, "..."))
+
+	// fallback when job not found
+	assert.Equal(t, "run error: some failure", extractLastLinesFromLog("", 3, errors.New("run error: some failure")))
+}
+
+func TestExtractLastLinesFromLog(t *testing.T) {
+	// 1. When no jobID and runErr is provided
+	assert.Equal(t, "run error: some failure", extractLastLinesFromLog("", 3, errors.New("run error: some failure")))
+
+	// 2. When no jobID and no runErr
+	assert.Equal(t, "", extractLastLinesFromLog("", 3, nil))
+
+	// 3. Setup temporary file logger to test retrieving logs
+	tempDir := t.TempDir()
+	oldJobLoggerCfg := config.DefaultConfig.JobLoggerConfigs
+	defer func() {
+		config.DefaultConfig.JobLoggerConfigs = oldJobLoggerCfg
+	}()
+
+	config.DefaultConfig.JobLoggerConfigs = []*config.LoggerConfig{
+		{
+			Name:  "FILE",
+			Level: "DEBUG",
+			Settings: map[string]any{
+				"base_dir": tempDir,
+			},
+		},
+	}
+	err := logger.Init(context.Background())
+	require.NoError(t, err)
+
+	jobID := "0123456789abcdef01234567"
+	logContent := "2026-10-15T00:00:00Z [INFO] step 1\n2026-10-15T00:00:01Z [INFO] step 2\n2026-10-15T00:00:02Z [ERROR] step 3 failed\n"
+	err = os.WriteFile(path.Join(tempDir, fmt.Sprintf("%s.log", jobID)), []byte(logContent), 0644)
+	require.NoError(t, err)
+
+	expectedLog := "2026-10-15T00:00:00Z [INFO] step 1\n2026-10-15T00:00:01Z [INFO] step 2\n2026-10-15T00:00:02Z [ERROR] step 3 failed"
+
+	// 4. Both runErr and job log exist -> returns runErr + "\n" + job log
+	expectedCombined := fmt.Sprintf("execution failed\n%s", expectedLog)
+	assert.Equal(t, expectedCombined, extractLastLinesFromLog(jobID, 3, errors.New("execution failed")))
+
+	// 5. Only job log exists (runErr is nil) -> returns job log
+	assert.Equal(t, expectedLog, extractLastLinesFromLog(jobID, 3, nil))
+
+	// 6. When runErr is identical to log message -> returns without duplication
+	sameJobID := "1123456789abcdef01234567"
+	err = os.WriteFile(path.Join(tempDir, fmt.Sprintf("%s.log", sameJobID)), []byte("same error\n"), 0644)
+	require.NoError(t, err)
+	assert.Equal(t, "same error", extractLastLinesFromLog(sameJobID, 3, errors.New("same error")))
+}
+

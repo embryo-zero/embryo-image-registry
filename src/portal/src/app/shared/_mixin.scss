@@ -1,0 +1,39 @@
+@mixin text-overflow 
+{ 
+    overflow: hidden;
+    text-overflow: ellipsis;
+    overflow-wrap:break-word;
+    white-space: nowrap
+}
+
+
+@mixin text-overflow-param($width) { 
+    width: $width; 
+
+    @include text-overflow;
+}
+
+@mixin grid-right-top-pos{
+    position: absolute;
+    z-index: 100;
+    right: 35px;
+    margin-top: 4px;
+}
+
+@mixin absolute-center($width:108px) {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    width: $width !important;
+    height: $width !important;
+}
+
+@mixin flex-center {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+@mixin dropdown-as-action-button {
+    margin: .25rem .5rem .25rem 0;
+}

@@ -1,0 +1,162 @@
+<div class="row content-space">
+    <div>
+        <div class="row flex-items-xs-between rightPos">
+            <div class="flex-xs-middle option-left"></div>
+            <div class="flex-xs-middle option-right">
+                <hbr-filter
+                    [withDivider]="true"
+                    filterPlaceholder="{{
+                        'MEMBER.FILTER_PLACEHOLDER' | translate
+                    }}"
+                    (filterEvt)="doSearch($event)"
+                    [currentValue]="searchMember"></hbr-filter>
+                <span class="refresh-btn" (click)="refresh()">
+                    <clr-icon shape="refresh"></clr-icon>
+                </span>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-12 col-md-12 col-sm-12 col-xs-12">
+        <clr-dg-action-bar>
+            <button
+                class="btn btn-secondary"
+                (click)="openAddMemberModal()"
+                [disabled]="!hasCreateMemberPermission">
+                <span
+                    ><clr-icon shape="plus" size="16"></clr-icon>&nbsp;{{
+                        'MEMBER.USER' | translate
+                    }}</span
+                >
+            </button>
+            <button
+                class="btn btn-secondary"
+                (click)="openAddGroupModal()"
+                [disabled]="
+                    !hasCreateMemberPermission ||
+                    !(isLdapMode || isHttpAuthMode || isOidcMode)
+                ">
+                <span
+                    ><clr-icon shape="plus" size="16"></clr-icon>&nbsp;{{
+                        'MEMBER.LDAP_GROUP' | translate
+                    }}</span
+                >
+            </button>
+            <clr-dropdown
+                [clrCloseMenuOnItemClick]="true"
+                class="btn btn-link"
+                clrDropdownTrigger>
+                <span id="member-action"
+                    >{{ 'MEMBER.ACTION' | translate
+                    }}<clr-icon shape="caret" direction="down"></clr-icon
+                ></span>
+                <clr-dropdown-menu *clrIfOpen>
+                    <label class="dropdown-header">{{
+                        'MEMBER.SET_ROLE' | translate
+                    }}</label>
+                    <div class="role-list-scroll">
+                        <button
+                            *ngFor="let role of builtinRoles"
+                            clrDropdownItem
+                            (click)="changeMembersRole(selectedRow, role.id)"
+                            [disabled]="
+                                !(
+                                    selectedRow.length &&
+                                    hasUpdateMemberPermission
+                                ) || onlySelf
+                            ">
+                            {{ getRoleDisplayName(role) | translate }}
+                            <span class="label label-blue role-builtin-badge">{{
+                                'MEMBER.BUILT_IN' | translate
+                            }}</span>
+                        </button>
+                        <div
+                            class="dropdown-divider"
+                            *ngIf="customRoles.length"></div>
+                        <button
+                            *ngFor="let role of customRoles"
+                            clrDropdownItem
+                            (click)="changeMembersRole(selectedRow, role.id)"
+                            [disabled]="
+                                !(
+                                    selectedRow.length &&
+                                    hasUpdateMemberPermission
+                                ) || onlySelf
+                            ">
+                            {{ role.name }}
+                        </button>
+                    </div>
+                    <div class="dropdown-divider"></div>
+                    <button
+                        clrDropdownItem
+                        (click)="openDeleteMembersDialog(selectedRow)"
+                        [disabled]="
+                            !(
+                                selectedRow.length && hasDeleteMemberPermission
+                            ) || onlySelf
+                        ">
+                        {{ 'MEMBER.REMOVE' | translate }}
+                    </button>
+                </clr-dropdown-menu>
+            </clr-dropdown>
+        </clr-dg-action-bar>
+        <clr-datagrid
+            clrDgSelectionType="multi"
+            (clrDgRefresh)="clrDgRefresh($event)"
+            [(clrDgSelected)]="selectedRow"
+            [clrDgLoading]="loading"
+            class="datagrid-pt">
+            <clr-dg-column>{{ 'MEMBER.NAME' | translate }}</clr-dg-column>
+            <clr-dg-column>{{
+                'MEMBER.MEMBER_TYPE' | translate
+            }}</clr-dg-column>
+            <clr-dg-column>{{ 'MEMBER.ROLE' | translate }}</clr-dg-column>
+            @for (m of members; track m) {
+            <clr-dg-row [clrDgItem]="m">
+                <clr-dg-cell>{{ m.entity_name }}</clr-dg-cell>
+                <clr-dg-cell>{{
+                    member_type_toString(m.entity_type) | translate
+                }}</clr-dg-cell>
+                <clr-dg-cell>
+                    @if (ChangeRoleOngoing(m.id)) {
+                    <span class="spinner spinner-inline"></span>
+                    } @if (!ChangeRoleOngoing(m.id)) {
+                    <span>{{ getMemberRoleDisplayName(m) }}</span>
+                    }
+                </clr-dg-cell>
+            </clr-dg-row>
+            }
+            <clr-dg-footer>
+                <clr-dg-pagination
+                    #pagination
+                    [clrDgPageSize]="pageSize"
+                    [(clrDgPage)]="page"
+                    [clrDgTotalItems]="total">
+                    <clr-dg-page-size
+                        [clrPageSizeOptions]="clrPageSizeOptions"
+                        >{{
+                            'PAGINATION.PAGE_SIZE' | translate
+                        }}</clr-dg-page-size
+                    >
+                    @if (total) {
+                    <span
+                        >{{ pagination.firstItem + 1 }} -
+                        {{ pagination.lastItem + 1 }}
+                        {{ 'MEMBER.OF' | translate }}
+                    </span>
+                    }
+                    {{ total }} {{ 'MEMBER.ITEMS' | translate }}
+                </clr-dg-pagination>
+            </clr-dg-footer>
+        </clr-datagrid>
+    </div>
+    <add-member
+        [projectId]="projectId"
+        [roles]="roles"
+        [rolesLoaded]="rolesLoaded"
+        (added)="addedMember($event)"></add-member>
+    <add-group
+        [projectId]="projectId"
+        [roles]="roles"
+        [rolesLoaded]="rolesLoaded"
+        (added)="addedGroup($event)"></add-group>
+</div>

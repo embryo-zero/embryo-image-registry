@@ -1,0 +1,114 @@
+<clr-modal
+    [(clrModalOpen)]="addMemberOpened"
+    [clrModalStaticBackdrop]="staticBackdrop"
+    [clrModalClosable]="closable">
+    <h3 class="modal-title">{{ 'MEMBER.NEW_MEMBER' | translate }}</h3>
+    <div class="modal-body">
+        <inline-alert class="modal-title"></inline-alert>
+        <label>{{ 'MEMBER.NEW_USER_INFO' | translate }}</label>
+        <form #memberForm="ngForm" class="clr-form clr-form-horizontal">
+            <div class="clr-form-control">
+                <label class="required clr-control-label">{{
+                    'MEMBER.NAME' | translate
+                }}</label>
+                <div
+                    class="clr-control-container"
+                    [class.clr-error]="
+                        (memberName.invalid &&
+                            (memberName.touched || memberName.dirty)) ||
+                        !isMemberNameValid
+                    ">
+                    <div class="clr-input-wrapper" (mouseleave)="leaveInput()">
+                        <input
+                            class="clr-input"
+                            type="text"
+                            id="member_name"
+                            [(ngModel)]="member.username"
+                            name="member_name"
+                            #memberName="ngModel"
+                            required
+                            (keyup)="handleValidation()"
+                            autocomplete="off" />
+                        <clr-icon
+                            class="clr-validate-icon"
+                            shape="exclamation-circle"></clr-icon>
+                        <span
+                            class="spinner spinner-inline"
+                            [hidden]="!checkOnGoing"></span>
+                        <div
+                            class="selectBox"
+                            [style.display]="
+                                searchedUserLists.length ? 'block' : 'none'
+                            ">
+                            <ul>
+                                @for (user of searchedUserLists; track user) {
+                                <li (click)="selectedName(user.username)">
+                                    {{ user.username }}
+                                </li>
+                                }
+                            </ul>
+                        </div>
+                    </div>
+                    @if ( (memberName.invalid && (memberName.touched ||
+                    memberName.dirty)) || !isMemberNameValid ) {
+                    <clr-control-error class="tooltip-content">
+                        {{ memberTooltip | translate }}
+                    </clr-control-error>
+                    }
+                </div>
+            </div>
+            <div class="clr-form-control">
+                <label class="clr-control-label"
+                    >{{ 'MEMBER.ROLE' | translate }}
+                </label>
+
+                <div class="clr-control-container">
+                    <span
+                        *ngIf="!rolesLoaded"
+                        class="spinner spinner-inline"></span>
+                    <div class="role-radio-list" *ngIf="rolesLoaded">
+                        <div *ngFor="let r of roles">
+                            <clr-radio-wrapper>
+                                <input
+                                    clrRadio
+                                    type="radio"
+                                    name="member_role"
+                                    id="add-member-role-{{ r.id }}"
+                                    [value]="r.id"
+                                    [(ngModel)]="roleId" />
+                                <label for="add-member-role-{{ r.id }}">
+                                    <strong *ngIf="r.is_builtin">{{
+                                        getRoleDisplayName(r) | translate
+                                    }}</strong>
+                                    <span *ngIf="!r.is_builtin">{{
+                                        r.name
+                                    }}</span>
+                                    <span
+                                        *ngIf="r.is_builtin"
+                                        class="label label-blue role-builtin-badge"
+                                        >{{
+                                            'MEMBER.BUILT_IN' | translate
+                                        }}</span
+                                    >
+                                </label>
+                            </clr-radio-wrapper>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </form>
+    </div>
+    <div class="modal-footer">
+        <button type="button" class="btn btn-outline" (click)="onCancel()">
+            {{ 'BUTTON.CANCEL' | translate }}
+        </button>
+        <button
+            [clrLoading]="btnStatus"
+            type="button"
+            class="btn btn-primary"
+            [disabled]="!isValid()"
+            (click)="onSubmit()">
+            {{ 'BUTTON.OK' | translate }}
+        </button>
+    </div>
+</clr-modal>

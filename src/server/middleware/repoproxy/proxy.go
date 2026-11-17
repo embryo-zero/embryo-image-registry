@@ -1,0 +1,788 @@
+// Copyright Project Harbor Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package repoproxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/goharbor/harbor/src/common/security"
+	"github.com/goharbor/harbor/src/common/security/proxycachesecret"
+	"github.com/goharbor/harbor/src/controller/project"
+	"github.com/goharbor/harbor/src/controller/proxy"
+	"github.com/goharbor/harbor/src/controller/registry"
+	robotCtl "github.com/goharbor/harbor/src/controller/robot"
+	"github.com/goharbor/harbor/src/lib"
+	libCache "github.com/goharbor/harbor/src/lib/cache"
+	"github.com/goharbor/harbor/src/lib/config"
+	"github.com/goharbor/harbor/src/lib/errors"
+	httpLib "github.com/goharbor/harbor/src/lib/http"
+	"github.com/goharbor/harbor/src/lib/log"
+	"github.com/goharbor/harbor/src/lib/metric"
+	"github.com/goharbor/harbor/src/lib/orm"
+	"github.com/goharbor/harbor/src/lib/pattern"
+	"github.com/goharbor/harbor/src/lib/q"
+	"github.com/goharbor/harbor/src/lib/redis"
+	"github.com/goharbor/harbor/src/pkg"
+	"github.com/goharbor/harbor/src/pkg/accessory"
+	accModel "github.com/goharbor/harbor/src/pkg/accessory/model"
+	proModels "github.com/goharbor/harbor/src/pkg/project/models"
+	"github.com/goharbor/harbor/src/pkg/proxy/connection"
+	"github.com/goharbor/harbor/src/pkg/reg/model"
+	"github.com/goharbor/harbor/src/server/middleware"
+)
+
+const (
+	contentLength                  = "Content-Length"
+	contentType                    = "Content-Type"
+	dockerContentDigest            = "Docker-Content-Digest"
+	etag                           = "Etag"
+	ensureTagInterval              = 10 * time.Second
+	ensureTagMaxRetry              = 60
+	upstreamRegistryLimitOnProject = "UPSTREAM_REGISTRY_LIMIT_ON_PROJECT" // if UPSTREAM_REGISTRY_LIMIT_ON_PROJECT is true, the upstream registry connection is based on project level, by default it is artifact level
+	referrerCacheTTL               = 7 * 24 * time.Hour
+	link                           = "Link"
+	xTotalCount                    = "X-Total-Count"
+)
+
+var proxyHeaderNames = []string{
+	contentType,
+	link,
+	xTotalCount,
+}
+
+var tooManyRequestsError = errors.New("too many requests to upstream registry").WithCode(errors.RateLimitCode)
+
+// BlobGetMiddleware handle get blob request
+func BlobGetMiddleware() func(http.Handler) http.Handler {
+	return middleware.New(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		if err := handleBlob(w, r, next); err != nil {
+			httpLib.SendError(w, err)
+		}
+	})
+}
+
+func handleBlob(w http.ResponseWriter, r *http.Request, next http.Handler) error {
+	ctx := r.Context()
+	art, p, proxyCtl, err := preCheck(ctx, true)
+	if err != nil {
+		return err
+	}
+
+	// go will panic if the network connection is ever interrupted, despite recovering successfully
+	// it will return an error type of http.ErrAbortHandler if it recovers. Middleware is expected to suppress this.
+	// golang/go#28239
+	defer func() {
+		r := recover()
+		err, ok := r.(error)
+
+		switch {
+		case r == nil:
+			return
+
+		case ok && errors.Is(err, http.ErrAbortHandler):
+			log.Debugf("Suppressed HttpAbortHandler: %s", err)
+			return // suppress
+
+		default:
+			panic(r)
+		}
+	}()
+
+	// Handle dockerhub request without library prefix
+	isDefault, name, err := defaultLibrary(ctx, p.RegistryID, art)
+	if err != nil {
+		return err
+	}
+	if isDefault {
+		http.Redirect(w, r, defaultBlobURL(p.Name, name, art.Digest), http.StatusMovedPermanently)
+		return nil
+	}
+
+	// Apply repository filter: if proxy_cache_filter_pattern is set, the repository must match
+	if err := checkRepositoryFilter(p, art); err != nil {
+		return err
+	}
+
+	if p.IsProxy() && config.Metric().Enabled {
+		metric.TotalProxyReq.WithLabelValues(p.Name, r.Method).Inc()
+	}
+	if !canProxy(r.Context(), p) || proxyCtl.UseLocalBlob(ctx, art) {
+		next.ServeHTTP(w, r)
+		return nil
+	}
+
+	if p.MaxUpstreamConnection() > 0 {
+		client, err := redis.GetHarborClient()
+		if err != nil {
+			return errors.NewErrs(err)
+		}
+		key := upstreamRegistryConnectionKey(art)
+		log.Debugf("handle blob, upstream registry connection limit key: %s", key)
+		if !connection.Limiter.Acquire(ctx, client, key, p.MaxUpstreamConnection()) {
+			log.Infof("current connection exceed max connections to upstream registry")
+			// send http code 429 to client
+			return tooManyRequestsError
+		}
+		defer connection.Limiter.Release(context.Background(), client, key) // use background context in defer to avoid been canceled
+	}
+
+	if config.Metric().Enabled {
+		metric.TotalProxyUpstreamReq.WithLabelValues(p.Name, r.Method).Inc()
+	}
+	size, reader, err := proxyCtl.ProxyBlob(ctx, p, art)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return serveBlob(w, reader, size, art.Digest)
+}
+
+// serveBlob sets the blob headers before streaming the body: the first write
+// commits the status line and headers, so setting Content-Length (and the
+// digest/ETag headers) afterwards is a no-op and truncated upstream reads
+// would be framed as complete chunked 200 responses that caches may store.
+func serveBlob(w http.ResponseWriter, reader io.Reader, size int64, dig string) error {
+	setHeaders(w, size, "", dig)
+	// Use io.CopyN to avoid out of memory when pulling big blob
+	written, err := io.CopyN(w, reader, size)
+	if err == nil {
+		return nil
+	}
+	if written == 0 {
+		// Headers are not committed yet; drop the blob headers so the caller's
+		// error response is not framed with the blob's Content-Length.
+		h := w.Header()
+		h.Del(contentLength)
+		h.Del(dockerContentDigest)
+		h.Del(etag)
+
+		return err
+	}
+	// The 200 and Content-Length are committed. Returning an error would make the
+	// caller append an error body to the blob stream; returning nil instead leaves
+	// the response short of Content-Length so clients and caches reject it.
+	log.Errorf("failed to stream blob %s after %d of %d bytes: %v", dig, written, size, err)
+	return nil
+}
+
+func preCheck(ctx context.Context, withProjectMetadata bool) (art lib.ArtifactInfo, p *proModels.Project, ctl proxy.Controller, err error) {
+	none := lib.ArtifactInfo{}
+	art = lib.GetArtifactInfo(ctx)
+	if art == none {
+		return none, nil, nil, errors.New("artifactinfo is not found").WithCode(errors.NotFoundCode)
+	}
+	ctl = proxy.ControllerInstance()
+	p, err = project.Ctl.GetByName(ctx, art.ProjectName, project.Metadata(withProjectMetadata))
+	return
+}
+
+// ManifestMiddleware middleware handle request for get or head manifest
+func ManifestMiddleware() func(http.Handler) http.Handler {
+	return middleware.New(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		if err := handleManifest(w, r, next); err != nil {
+			if errors.IsNotFoundErr(err) {
+				httpLib.SendError(w, err)
+				return
+			}
+			if errors.IsRateLimitError(err) {
+				httpLib.SendError(w, tooManyRequestsError)
+				return
+			}
+			log.Errorf("failed to proxy manifest, fallback to local, request uri: %v, error: %v", r.RequestURI, err)
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+func defaultLibrary(ctx context.Context, registryID int64, a lib.ArtifactInfo) (bool, string, error) {
+	if registryID <= 0 {
+		return false, "", nil
+	}
+	reg, err := registry.Ctl.Get(ctx, registryID)
+	if err != nil {
+		return false, "", err
+	}
+	if reg.Type != model.RegistryTypeDockerHub {
+		return false, "", nil
+	}
+	name := strings.TrimPrefix(a.Repository, a.ProjectName+"/")
+	if strings.Contains(name, "/") {
+		return false, "", nil
+	}
+	return true, name, nil
+}
+
+// defaultManifestURL return the real url for request with default project
+func defaultManifestURL(projectName string, name string, a lib.ArtifactInfo) string {
+	return fmt.Sprintf("/v2/%s/library/%s/manifests/%s", projectName, name, a.Reference)
+}
+
+// defaultBlobURL return the real url for request with default project
+func defaultBlobURL(projectName string, name string, digest string) string {
+	return fmt.Sprintf("/v2/%s/library/%s/blobs/%s", projectName, name, digest)
+}
+
+// defaultTagURL return the real url for request with default project
+func defaultTagURL(projectName string, name string) string {
+	return fmt.Sprintf("/v2/%s/library/%s/tags/list", projectName, name)
+}
+
+// matchRepositoryFilter returns true if repository matches the filter.
+// filterPattern is the plain pattern string; filterKind is "doublestar" or "regex" (defaults to doublestar when empty).
+// If filterPattern is empty, all repositories are allowed.
+// An invalid pattern is treated as no match.
+func matchRepositoryFilter(repository, filterPattern, filterKind string) bool {
+	log.Debugf("matching repository %q against filter pattern: %q (kind: %s)", repository, filterPattern, filterKind)
+	matched, err := pattern.Match(repository, filterPattern, filterKind)
+	if err != nil {
+		log.Warningf("invalid proxy_cache_filter_pattern %q (kind: %s): %v", filterPattern, filterKind, err)
+		return false
+	}
+	log.Debugf("repository %q match result: %v (filter: %q, kind: %s)", repository, matched, filterPattern, filterKind)
+	return matched
+}
+
+// checkRepositoryFilter returns a NotFoundError if the project has a proxy_cache_filter_pattern
+// set and the artifact's repository does not match it. It is enforced for both manifest and
+// blob requests so the filter acts as an access boundary rather than a manifest-only convenience,
+// since a client that knows a blob digest out-of-band could otherwise bypass the filter.
+func checkRepositoryFilter(p *proModels.Project, art lib.ArtifactInfo) error {
+	filterPattern, ok := p.GetMetadata(proModels.ProMetaProxyCacheFilterPattern)
+	if !ok || filterPattern == "" {
+		return nil
+	}
+	filterKind, _ := p.GetMetadata(proModels.ProMetaProxyCacheFilterKind)
+	remoteRepo := strings.TrimPrefix(art.Repository, art.ProjectName+"/")
+	if !matchRepositoryFilter(remoteRepo, filterPattern, filterKind) {
+		log.Debugf("blocked proxy cache pull for project %q repository %q: repository does not match filter %q (kind: %s)", p.Name, remoteRepo, filterPattern, filterKind)
+		return errors.NotFoundError(fmt.Errorf("repository %q does not match project repository filter", remoteRepo))
+	}
+	return nil
+}
+
+// upstreamRegistryConnectionKey get upstream registry connection key
+func upstreamRegistryConnectionKey(art lib.ArtifactInfo) string {
+	limitOnProject := os.Getenv(upstreamRegistryLimitOnProject)
+	if strings.EqualFold("true", limitOnProject) {
+		return fmt.Sprintf("{upstream_registry_connection}:%s", art.ProjectName)
+	}
+	return fmt.Sprintf("{upstream_registry_connection}:%s:%s", art.Repository, art.Digest)
+}
+
+func handleManifest(w http.ResponseWriter, r *http.Request, next http.Handler) error {
+	ctx := r.Context()
+	art, p, proxyCtl, err := preCheck(ctx, true)
+	if err != nil {
+		return err
+	}
+
+	// Handle dockerhub request without library prefix
+	defaultProj, name, err := defaultLibrary(ctx, p.RegistryID, art)
+	if err != nil {
+		return err
+	}
+	if defaultProj {
+		http.Redirect(w, r, defaultManifestURL(p.Name, name, art), http.StatusMovedPermanently)
+		return nil
+	}
+
+	// Apply repository filter: if proxy_cache_filter_pattern is set, the repository must match
+	if err := checkRepositoryFilter(p, art); err != nil {
+		return err
+	}
+
+	if p.IsProxy() && config.Metric().Enabled {
+		metric.TotalProxyReq.WithLabelValues(p.Name, r.Method).Inc()
+	}
+	if !canProxy(r.Context(), p) {
+		next.ServeHTTP(w, r)
+		return nil
+	}
+	remote, err := proxy.NewRemoteHelper(r.Context(), p.RegistryID, proxy.WithSpeed(p.ProxyCacheSpeed()))
+	if err != nil {
+		return err
+	}
+	useLocal, man, err := proxyCtl.UseLocalManifest(ctx, art, remote, p)
+	if err != nil {
+		return err
+	}
+	if useLocal {
+		if man != nil {
+			w.Header().Set(contentLength, fmt.Sprintf("%v", len(man.Content)))
+			w.Header().Set(contentType, man.ContentType)
+			w.Header().Set(dockerContentDigest, man.Digest)
+			w.Header().Set(etag, man.Digest)
+			if r.Method == http.MethodGet {
+				_, err = w.Write(man.Content)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		next.ServeHTTP(w, r)
+		return nil
+	}
+	if p.MaxUpstreamConnection() > 0 {
+		client, err := redis.GetHarborClient()
+		if err != nil {
+			return errors.NewErrs(err)
+		}
+		key := upstreamRegistryConnectionKey(art)
+		log.Debugf("handle manifest key %v", key)
+		if !connection.Limiter.Acquire(ctx, client, key, p.MaxUpstreamConnection()) {
+			log.Infof("current connection exceed max connections to upstream registry")
+			// send http code 429 to client
+			return tooManyRequestsError
+		}
+		defer connection.Limiter.Release(context.Background(), client, key) // use background context in defer to avoid been canceled
+	}
+
+	if config.Metric().Enabled {
+		metric.TotalProxyUpstreamReq.WithLabelValues(p.Name, r.Method).Inc()
+	}
+	log.Debugf("the tag is %v, digest is %v", art.Tag, art.Digest)
+	if r.Method == http.MethodHead {
+		err = proxyManifestHead(ctx, w, proxyCtl, p, art, remote)
+	} else if r.Method == http.MethodGet {
+		log.Warningf("Artifact: %v:%v, digest:%v is not found in proxy cache, fetch it from remote repo", art.Repository, art.Tag, art.Digest)
+		err = proxyManifestGet(ctx, w, proxyCtl, p, art, remote)
+	}
+	if err != nil {
+		if errors.IsNotFoundErr(err) || errors.IsRateLimitError(err) {
+			return err
+		}
+		log.Warningf("Proxy to remote failed, fallback to local repo, error: %v", err)
+		next.ServeHTTP(w, r)
+	}
+	return nil
+}
+
+func proxyManifestGet(ctx context.Context, w http.ResponseWriter, ctl proxy.Controller, _ *proModels.Project, art lib.ArtifactInfo, remote proxy.RemoteInterface) error {
+	man, err := ctl.ProxyManifest(ctx, art, remote)
+	if err != nil {
+		return err
+	}
+	ct, payload, err := man.Payload()
+	if err != nil {
+		return err
+	}
+	setHeaders(w, int64(len(payload)), ct, art.Digest)
+	if _, err = w.Write(payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func canProxy(ctx context.Context, p *proModels.Project) bool {
+	if p.RegistryID < 1 {
+		return false
+	}
+	reg, err := registry.Ctl.Get(ctx, p.RegistryID)
+	if err != nil {
+		log.Errorf("failed to get registry, error:%v", err)
+		return false
+	}
+	if reg.Status != model.Healthy {
+		log.Errorf("current registry is unhealthy, regID:%v, Name:%v, Status: %v", reg.ID, reg.Name, reg.Status)
+	}
+	return reg.Status == model.Healthy
+}
+
+func setHeaders(w http.ResponseWriter, size int64, mediaType string, dig string) {
+	h := w.Header()
+	h.Set(contentLength, fmt.Sprintf("%v", size))
+	if len(mediaType) > 0 {
+		h.Set(contentType, mediaType)
+	}
+	h.Set(dockerContentDigest, dig)
+	h.Set(etag, dig)
+}
+
+// isProxySession check if current security context is proxy session
+func isProxySession(ctx context.Context, projectName string) bool {
+	sc, ok := security.FromContext(ctx)
+	if !ok {
+		log.Error("Failed to get security context")
+		return false
+	}
+	username := sc.GetUsername()
+	if username == proxycachesecret.ProxyCacheService {
+		return true
+	}
+
+	robotPrefix := config.RobotPrefix(ctx)
+	scannerPrefix := config.ScannerRobotPrefix(ctx)
+	prefix := fmt.Sprintf("%s%s+%s", robotPrefix, projectName, scannerPrefix)
+	if !strings.HasPrefix(username, prefix) {
+		return false
+	}
+
+	// Since we cannot rely on getting robot.SecurityContext directly under proxy cache sbom generation,
+	// its security context is v2_token when pushing sbom, not robot SecurityContext
+	// we verify by fetching the robot account by username from database / controller.
+	// The robot name used to query is the username without the robot prefix.
+	robotName := strings.TrimPrefix(username, robotPrefix)
+	robots, err := robotCtl.Ctl.List(ctx, q.New(q.KeyWords{
+		"name": robotName,
+	}), nil)
+	if err != nil {
+		log.Errorf("failed to list robots for validation: %v", err)
+		return false
+	}
+	if len(robots) == 0 {
+		log.Infof("no robot found with name: %s", robotName)
+		return false
+	}
+	r := robots[0]
+	// Scanner robot accounts created by system must be invisible and have CreatorRef == 0.
+	// User-created robot accounts created via API have Visible == true and CreatorRef > 0.
+	if r.Visible || r.CreatorRef != 0 {
+		log.Warningf("current robot is not a scanner robot, visible: %v, creatorRef: %v", r.Visible, r.CreatorRef)
+		return false
+	}
+	return true
+}
+
+// DisableBlobAndManifestUploadMiddleware disable push artifact to a proxy project with a non-proxy session
+func DisableBlobAndManifestUploadMiddleware() func(http.Handler) http.Handler {
+	return middleware.New(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		ctx := r.Context()
+		art := lib.GetArtifactInfo(ctx)
+		p, err := project.Ctl.GetByName(ctx, art.ProjectName)
+		if err != nil {
+			httpLib.SendError(w, err)
+			return
+		}
+		if p.IsProxy() && !isProxySession(ctx, art.ProjectName) {
+			httpLib.SendError(w,
+				errors.DeniedError(
+					errors.Errorf("Cannot push artifact to a proxy project: %v", p.Name)))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func proxyManifestHead(ctx context.Context, w http.ResponseWriter, ctl proxy.Controller, _ *proModels.Project, art lib.ArtifactInfo, remote proxy.RemoteInterface) error {
+	exist, desc, err := ctl.HeadManifest(ctx, art, remote)
+	if err != nil {
+		return err
+	}
+	if !exist || desc == nil {
+		return errors.NotFoundError(fmt.Errorf("the tag %v:%v is not found", art.Repository, art.Tag))
+	}
+	go func(art lib.ArtifactInfo) {
+		// After docker 20.10 or containerd, the client heads the tag first,
+		// Then GET the image by digest, in order to associate the tag with the digest
+		// Ensure tag after head request, make sure tags in proxy cache keep update
+		bCtx := orm.Context()
+		for range ensureTagMaxRetry {
+			time.Sleep(ensureTagInterval)
+			bArt := lib.ArtifactInfo{ProjectName: art.ProjectName, Repository: art.Repository, Digest: string(desc.Digest)}
+			err := ctl.EnsureTag(bCtx, bArt, art.Tag)
+			if err == nil {
+				return
+			}
+			log.Debugf("Failed to ensure tag %+v , error %v", art, err)
+		}
+	}(art)
+
+	w.Header().Set(contentType, desc.MediaType)
+	w.Header().Set(contentLength, fmt.Sprintf("%v", desc.Size))
+	w.Header().Set(dockerContentDigest, string(desc.Digest))
+	w.Header().Set(etag, string(desc.Digest))
+	return nil
+}
+
+func ProxyReferrerMiddleware() func(http.Handler) http.Handler {
+	return middleware.New(func(w http.ResponseWriter, r *http.Request, next http.Handler) {
+		ctx := r.Context()
+		art := lib.GetArtifactInfo(ctx)
+		p, err := project.Ctl.GetByName(ctx, art.ProjectName, project.Metadata(true))
+		if err != nil {
+			httpLib.SendError(w, err)
+			return
+		}
+		if !p.IsProxy() {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !p.ProxyReferrerAPI() {
+			log.Debug("the proxy referrer API is not enabled for current project, fallback to local registry")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Apply repository filter: if proxy_cache_filter_pattern is set, the repository must match
+		if err := checkRepositoryFilter(p, art); err != nil {
+			httpLib.SendError(w, err)
+			return
+		}
+
+		log.Debug("current project is a harbor proxy cache project, will proxy the referrer API to the upstream")
+		remote, err := proxy.NewRemoteHelper(r.Context(), p.RegistryID, proxy.WithSpeed(p.ProxyCacheSpeed()))
+		if err != nil {
+			log.Errorf("failed to proxy the referrer API to upstream, error %v, fallback to local registry", err)
+			next.ServeHTTP(w, r)
+			return
+		}
+		// for any error, fallback to local registry
+		if proxyErr := proxyReferrerGet(r, w, art, remote, p.RegistryID); proxyErr != nil {
+			log.Errorf("failed to proxy the referrer API to upstream, error %v, fallback to local registry", proxyErr)
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+// referrerCache defines the cache structure for referrer index
+type referrerCache struct {
+	Content []byte              `json:"content"`
+	Header  map[string][]string `json:"header"`
+}
+
+// writeProxyHeaders writes proxy-allowed headers from headerMap to response writer
+func writeProxyHeaders(w http.ResponseWriter, headerMap map[string][]string) {
+	for k, v := range headerMap {
+		if slices.Contains(proxyHeaderNames, k) {
+			for _, hv := range v {
+				w.Header().Add(k, hv)
+			}
+		}
+	}
+}
+
+// referrerCacheKey generates cache key for referrer index
+func referrerCacheKey(requestURI string) string {
+	return fmt.Sprintf("{referrer_cache}:%s", requestURI)
+}
+
+// hasNextLink checks whether the Link header in headerMap contains a rel="next" entry,
+// indicating that there are more pages of results from the upstream.
+func hasNextLink(headerMap map[string][]string) bool {
+	linkValues, ok := headerMap[link]
+	if !ok || len(linkValues) == 0 {
+		return false
+	}
+	for _, lv := range linkValues {
+		links := lib.ParseLinks(lv)
+		for _, l := range links {
+			if l.Rel == "next" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rewritePaginationLinks rewrites any Link pagination headers to reference the local Harbor proxy-cache path instead of the upstream remote path.
+func rewritePaginationLinks(headerMap map[string][]string, art lib.ArtifactInfo) {
+	linkValues, ok := headerMap[link]
+	if !ok || len(linkValues) == 0 {
+		return
+	}
+
+	remoteRepo := proxy.GetRemoteRepo(art)
+	localRepo := art.Repository
+
+	remotePathPrefix := "/v2/" + remoteRepo + "/referrers/"
+	localPathPrefix := "/v2/" + localRepo + "/referrers/"
+
+	var rewrittenLinkValues []string
+	for _, lv := range linkValues {
+		links := lib.ParseLinks(lv)
+		for _, l := range links {
+			u, err := url.Parse(l.URL)
+			if err != nil {
+				log.Warningf("failed to parse pagination link URL %s: %v", l.URL, err)
+				continue
+			}
+			// Rewrite the path prefix and clear scheme/host to ensure a relative Link
+			if strings.HasPrefix(u.Path, remotePathPrefix) {
+				u.Path = localPathPrefix + strings.TrimPrefix(u.Path, remotePathPrefix)
+				u.Scheme = ""
+				u.Host = ""
+				l.URL = u.String()
+			}
+		}
+		rewrittenLinkValues = append(rewrittenLinkValues, links.String())
+	}
+	headerMap[link] = rewrittenLinkValues
+}
+
+// getLocalReferrers queries the local accessory table for accessories with source "local"
+// and builds OCI descriptors from the corresponding artifacts.
+func getLocalReferrers(ctx context.Context, art lib.ArtifactInfo, artifactType string) []ocispec.Descriptor {
+	query := q.New(q.KeyWords{
+		"SubjectArtifactDigest": art.Reference,
+		"SubjectArtifactRepo":   art.Repository,
+		"Source":                accModel.TypeLocalReferrer,
+	})
+	accs, err := accessory.Mgr.List(ctx, query)
+	if err != nil {
+		log.Warningf("failed to list local accessories for %s@%s: %v", art.Repository, art.Reference, err)
+		return nil
+	}
+	if len(accs) == 0 {
+		return nil
+	}
+
+	var descs []ocispec.Descriptor
+	for _, acc := range accs {
+		accData := acc.GetData()
+		accArt, err := pkg.ArtifactMgr.GetByDigest(ctx, art.Repository, accData.Digest)
+		if err != nil {
+			log.Warningf("failed to get artifact for local accessory %s: %v", accData.Digest, err)
+			continue
+		}
+		if artifactType != "" && accArt.ArtifactType != artifactType {
+			continue
+		}
+		desc := ocispec.Descriptor{
+			MediaType:    accArt.ManifestMediaType,
+			Size:         accArt.Size,
+			Digest:       digest.Digest(accArt.Digest),
+			Annotations:  accArt.Annotations,
+			ArtifactType: accArt.ArtifactType,
+		}
+		descs = append(descs, desc)
+	}
+	return descs
+}
+
+func serveCachedReferrers(ctx context.Context, w http.ResponseWriter, key string) error {
+	c := libCache.Default()
+	if c == nil {
+		return fmt.Errorf("the global cache is not initialized")
+	}
+	cachedContent := referrerCache{}
+	err := c.Fetch(ctx, key, &cachedContent)
+	if err != nil {
+		log.Debugf("failed to get referrer index from cache, key: %s, error: %v", key, err)
+		return fmt.Errorf("failed to get referrer index from cache")
+	}
+	if len(cachedContent.Content) == 0 {
+		log.Debugf("no cached referrer index found in cache, key: %s", key)
+		return fmt.Errorf("the upstream registry is unhealthy or no cached referrer index found")
+	}
+
+	log.Debugf("referrer index found in cache, key: %s", key)
+	writeProxyHeaders(w, cachedContent.Header)
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, bytes.NewReader(cachedContent.Content)) // return cached content if registry is unhealthy
+	if err != nil {
+		// just log the error, as the response has been written
+		log.Errorf("failed to copy response body from cache, %v", err)
+	}
+	return nil
+}
+
+func proxyReferrerGet(r *http.Request, w http.ResponseWriter, art lib.ArtifactInfo, remote proxy.RemoteInterface, registryID int64) error {
+	c := libCache.Default()
+	if c == nil {
+		return fmt.Errorf("the global cache is not initialized")
+	}
+	ctx := r.Context()
+	// get registry status
+	reg, err := registry.Ctl.Get(ctx, registryID)
+	if err != nil {
+		return err
+	}
+	key := referrerCacheKey(r.RequestURI)
+	// if registry is unhealthy, try to get from cache
+	if reg.Status != model.Healthy {
+		return serveCachedReferrers(ctx, w, key)
+	}
+
+	index, headerMap, err := remote.ListReferrers(proxy.GetRemoteRepo(art), art.Reference, r.URL.RawQuery)
+	// if upstream return 404, return not found error
+	if errors.IsNotFoundErr(err) {
+		httpLib.SendError(w, err)
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// Rewrite upstream pagination links before caching or writing headers
+	rewritePaginationLinks(headerMap, art)
+
+	// append local referrers (source=local) only on the last page of remote results
+	isLastPage := !hasNextLink(headerMap)
+	var localDescs []ocispec.Descriptor
+	if isLastPage {
+		artifactTypeFilter := r.URL.Query().Get("artifactType")
+		localDescs = getLocalReferrers(ctx, art, artifactTypeFilter)
+		if len(localDescs) > 0 {
+			log.Debugf("appending %d local referrer(s) to remote referrer index for %s@%s", len(localDescs), art.Repository, art.Reference)
+			index.Manifests = append(index.Manifests, localDescs...)
+		}
+	}
+
+	// Preserve the upstream total and add the number of merged local descriptors
+	upstreamTotal := 0
+	hasUpstreamTotal := false
+	if len(headerMap[xTotalCount]) > 0 {
+		if total, err := strconv.Atoi(headerMap[xTotalCount][0]); err == nil {
+			upstreamTotal = total
+			hasUpstreamTotal = true
+		}
+	}
+	if !hasUpstreamTotal {
+		// Fallback to the number of remote manifests in the response
+		upstreamTotal = len(index.Manifests) - len(localDescs)
+	}
+	headerMap[xTotalCount] = []string{strconv.Itoa(upstreamTotal + len(localDescs))}
+
+	// Marshal before touching the response so we can still return an error on failure.
+	b, err := json.Marshal(index)
+	if err != nil {
+		return err
+	}
+	cacheContent := referrerCache{
+		Content: b,
+		Header:  headerMap,
+	}
+	log.Debugf("save referrer index to cache, key: %s", key)
+	if err := c.Save(ctx, key, cacheContent, referrerCacheTTL); err != nil {
+		log.Warningf("failed to save referrer index to cache, key: %s, error: %v", key, err)
+	}
+
+	log.Debugf("current headers from upstream registry: %v", headerMap)
+	writeProxyHeaders(w, headerMap)
+	w.WriteHeader(http.StatusOK)
+	_, err = io.Copy(w, bytes.NewReader(b))
+	if err != nil {
+		// just log the error, as the response has already been committed
+		log.Errorf("failed to copy response body, %v", err)
+	}
+	return nil
+}

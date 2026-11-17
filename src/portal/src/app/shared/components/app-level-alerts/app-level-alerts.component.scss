@@ -1,0 +1,22 @@
+.alert-text {
+  flex: 0 0 auto !important;
+}
+
+.alert-action {
+  text-decoration: underline
+}
+
+.last {
+  position: absolute;
+  right: 3rem;
+}
+
+.no-underline {
+  text-decoration: none;
+}
+
+.banner-message {
+  min-width: 0;
+  /* stylelint-disable-next-line declaration-property-value-keyword-no-deprecated */
+  word-break: break-word;
+}
